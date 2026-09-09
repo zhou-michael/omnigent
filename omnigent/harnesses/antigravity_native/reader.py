@@ -67,6 +67,7 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_gemini_dir,
     is_placeholder_conversation_id,
     read_bridge_state,
     write_bridge_state,
@@ -793,6 +794,47 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
+def _find_active_cascade_fallback(bridge_dir: Path) -> tuple[str, int] | None:
+    """Discover a running cascade in session's Gemini dir when cascade_id is missing.
+
+    If agy rejected an un-resumable conversation ID and minted a new cascade on launch,
+    the bridge state remains on the old cascade_id, causing GetConversationMetadata to 500
+    indefinitely. This checks if agy wrote a new conversation database (.db) into this
+    session's isolated conversations directory, validates it against candidate RPC ports,
+    and adopts it in place so the reader can bind immediately.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: ``(cascade_id, port)`` if a live cascade in this session's Gemini dir
+        matched a candidate agy RPC port, else ``None``.
+    """
+    conv_dir = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "conversations"
+    if not conv_dir.is_dir():
+        return None
+    candidate_db_stems = [
+        p.stem
+        for p in conv_dir.glob("*.db")
+        if not p.name.endswith("-shm") and not p.name.endswith("-wal")
+    ]
+    if not candidate_db_stems:
+        return None
+
+    # Sort candidates by mtime (newest first)
+    candidate_db_stems.sort(
+        key=lambda stem: (conv_dir / f"{stem}.db").stat().st_mtime,
+        reverse=True,
+    )
+
+    ports = _candidate_agy_rpc_ports()
+    for port in ports:
+        for candidate_id in candidate_db_stems:
+            if _conversation_matches(port, candidate_id):
+                state = read_bridge_state(bridge_dir)
+                if state is not None:
+                    _adopt_cascade_in_place(bridge_dir, state.session_id, candidate_id)
+                return candidate_id, port
+    return None
+
+
 async def _discover(
     bridge_dir: Path,
     *,
@@ -815,7 +857,7 @@ async def _discover(
     :param bridge_dir: Native Antigravity bridge directory.
     :param poll_interval_s: Seconds to wait between discovery polls.
     :param stop: Predicate consulted only when a round did NOT resolve; when it
-        returns ``True`` the discovery loop gives up (the runner owns restart).
+    returns ``True`` the discovery loop gives up (the runner owns restart).
     :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
         fired before discovery completed.
     """
@@ -831,6 +873,19 @@ async def _discover(
                     port,
                 )
                 return cascade_id, port
+            # Fallback: if the bridge-state cascade_id was rejected or missing on agy
+            # (e.g. agy ignored --conversation flag and minted a new cascade), check
+            # if a live cascade exists under this session's isolated Gemini dir.
+            fallback = await asyncio.to_thread(_find_active_cascade_fallback, bridge_dir)
+            if fallback is not None:
+                fb_cascade_id, fb_port = fallback
+                _logger.info(
+                    "agy RPC reader adopted fallback cascade: bridge_dir=%s cascade=%s port=%s",
+                    bridge_dir,
+                    fb_cascade_id,
+                    fb_port,
+                )
+                return fb_cascade_id, fb_port
         if stop():
             return None
         await _sleep(poll_interval_s)

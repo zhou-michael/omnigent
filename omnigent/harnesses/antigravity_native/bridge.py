@@ -31,6 +31,7 @@ _STATE_FILE = "state.json"
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
 _BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_STATE_ROOT: Path | None = None
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -158,6 +159,25 @@ def bridge_root() -> Path:
     return _BRIDGE_ROOT
 
 
+def state_root() -> Path:
+    """
+    Return the configured Antigravity-native persistent state root.
+
+    Persistent agy session state (conversations database, brain, summaries) lives
+    here rather than inside the reapable :func:`bridge_root` so that daemon or
+    runner restarts do not wipe conversation history.
+
+    Tests may monkeypatch :data:`_STATE_ROOT` or :data:`_BRIDGE_ROOT` to isolate
+    persistent state files.
+
+    :returns: Absolute root for Antigravity-native persistent state directories, e.g.
+        ``Path("~/.omnigent/antigravity-state")``.
+    """
+    if _STATE_ROOT is not None:
+        return _STATE_ROOT
+    return _BRIDGE_ROOT.parent / "antigravity-state"
+
+
 @dataclass(frozen=True)
 class AntigravityNativeBridgeState:
     """
@@ -263,8 +283,26 @@ def prune_orphaned_bridge_dirs() -> int:
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 
+    Before wiping any orphaned bridge dir, any legacy ``agy-home`` subdirectory
+    is safely rescued into :func:`state_root` so conversation history is never lost.
+
     :returns: The number of orphaned bridge dirs removed.
     """
+    try:
+        root = bridge_root()
+        if root.is_dir():
+            for entry in root.iterdir():
+                legacy = entry / "agy-home"
+                if legacy.is_dir() and not legacy.is_symlink():
+                    target = agy_state_dir(entry) / "agy-home"
+                    if not target.exists():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with contextlib.suppress(OSError):
+                            import shutil
+
+                            shutil.move(str(legacy), str(target))
+    except Exception:
+        _logger.exception("Error migrating legacy agy-home dirs before orphan sweep")
     return native_bridge_common.prune_orphaned_dirs(bridge_root())
 
 
@@ -392,19 +430,44 @@ _AGY_SKILL_DIRS = (
 )
 
 
+def agy_state_dir(bridge_dir: Path) -> Path:
+    """Return the persistent state directory for *bridge_dir*.
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :returns: Absolute parent directory for this session's persistent agy state.
+    """
+    if _STATE_ROOT is not None:
+        return _STATE_ROOT / bridge_dir.name
+    if bridge_dir.parent.name == "antigravity-native":
+        return bridge_dir.parent.parent / "antigravity-state" / bridge_dir.name
+    return bridge_dir.parent / "antigravity-state" / bridge_dir.name
+
+
 def agy_home_dir(bridge_dir: Path) -> Path:
     """Return the parent directory for this session's isolated agy state.
 
     The actual agy config/state root is :func:`agy_gemini_dir`, passed to agy via
-    ``--gemini_dir``. Keeping this parent below *bridge_dir* makes it naturally
-    per-session and easy to tear down with the bridge, while preserving the real
-    ``HOME`` for auth providers that depend on platform state such as macOS
-    Keychain.
+    ``--gemini_dir``. The state lives under :func:`state_root` outside of
+    *bridge_dir* so that when orphaned bridge directories are reaped at runner or
+    daemon startup, agy's persistent conversation history (conversations, brain,
+    and summaries) is preserved across restarts for seamless resumption.
 
     :param bridge_dir: Native Antigravity bridge directory.
     :returns: Absolute parent path for this session's isolated agy state.
     """
-    return bridge_dir / "agy-home"
+    target = agy_state_dir(bridge_dir) / "agy-home"
+
+    # Transparent migration: if legacy state exists inside bridge_dir and target is
+    # empty, move it out.
+    legacy = bridge_dir / "agy-home"
+    if legacy.is_dir() and not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            import shutil
+
+            shutil.move(str(legacy), str(target))
+
+    return target
 
 
 def agy_gemini_dir(bridge_dir: Path) -> Path:
@@ -1371,11 +1434,19 @@ def _draft_in_input_region(pane: str, needle: str, baseline_region: str) -> bool
     normalized_needle = needle.strip() if needle else ""
     if not normalized_needle:
         return bool(candidates)
-    return any(
+    if any(
         line == normalized_needle
         or line.startswith(normalized_needle)
         or normalized_needle in line
         for line in candidates
+    ):
+        return True
+    # If the needle wraps across terminal line boundaries (e.g. [Attached: <path>]),
+    # check the joined candidate text as well.
+    joined = " ".join(candidates)
+    return (
+        normalized_needle in joined
+        or normalized_needle.replace(" ", "") in joined.replace(" ", "")
     )
 
 
