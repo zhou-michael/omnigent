@@ -7706,6 +7706,7 @@ async def _delete_native_bridge_dirs(
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
+        agy_state_dir,
     )
     from omnigent.harnesses.antigravity_native.bridge import (
         bridge_dir_for_bridge_id as antigravity_bridge_dir,
@@ -7757,9 +7758,12 @@ async def _delete_native_bridge_dirs(
             session_id=session_id,
         )
 
+    agy_bridge_id = labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id
     targets = {
-        antigravity_bridge_dir(labels.get(ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),
+        antigravity_bridge_dir(agy_bridge_id),
         antigravity_bridge_dir(session_id),
+        agy_state_dir(antigravity_bridge_dir(agy_bridge_id)),
+        agy_state_dir(antigravity_bridge_dir(session_id)),
         claude_bridge_dir(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
         claude_bridge_dir(session_id),
         codex_bridge_dir(labels.get(CODEX_NATIVE_BRIDGE_ID_LABEL_KEY) or session_id),

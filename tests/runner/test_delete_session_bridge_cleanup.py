@@ -140,12 +140,25 @@ async def test_cleanup_resources_removes_native_bridge_dir(
     (bridge_dir / "bridge.json").write_text("{}")
     assert bridge_dir.exists()
 
+    state_dir = None
+    if family == "antigravity":
+        from omnigent.harnesses.antigravity_native.bridge import agy_state_dir
+
+        state_dir = agy_state_dir(bridge_dir)
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "marker.txt").write_text("state")
+        assert state_dir.exists()
+
     resp = await client.delete(f"/v1/sessions/{session_id}/resources")
     assert resp.status_code == 200
 
     assert not bridge_dir.exists(), (
         f"{family} bridge dir must be deleted on the real /resources path"
     )
+    if state_dir is not None:
+        assert not state_dir.exists(), (
+            f"{family} state dir must be deleted on the real /resources path"
+        )
 
 
 # ── #3728: spec-fill generation guard ───────────────────────────────────────

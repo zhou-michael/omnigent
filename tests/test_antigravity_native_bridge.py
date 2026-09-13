@@ -1334,6 +1334,24 @@ def test_draft_in_input_region_matches_short_message_by_composer_change() -> Non
     assert not _mod._draft_in_input_region(pane_after_submit, "", baseline)
 
 
+def test_draft_in_input_region_matches_wrapped_attachment_needle() -> None:
+    """A needle that wraps across lines matches joined candidate text."""
+    sep = "─" * 60
+    baseline = _mod._agy_input_region(f"{sep}\n>\n{sep}\n? for shortcuts")
+    content = "[Attached: /home/michaelzhou/.omnigent/uploads/screenshot.png] can u see this"
+    needle = _mod._submit_needle(content)
+    # Simulate agy wrapping at the space after [Attached:
+    pane_with_wrapped_draft = (
+        f"{sep}\n"
+        "> [Attached:\n"
+        "  /home/michaelzhou/.omnigent/uploads/screenshot.png]\n"
+        "  can u see this\n"
+        f"{sep}\n"
+        "? for shortcuts"
+    )
+    assert _mod._draft_in_input_region(pane_with_wrapped_draft, needle, baseline)
+
+
 def test_format_pane_debug_tail_redacts_email_and_secrets() -> None:
     """The diagnostic pane tail redacts emails and common secret shapes (#1598)."""
     pane = (
@@ -1899,10 +1917,25 @@ def test_seed_isolated_agy_home_skill_links_never_mutate_real_home(
     assert sorted(p.name for p in real_shared.iterdir()) == []
 
 
-def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:
-    """The isolated state parent is a child of the per-session bridge dir."""
-    bridge_dir = tmp_path / "bridge"
-    assert agy_home_dir(bridge_dir).parent == bridge_dir
+def test_agy_home_dir_is_outside_bridge_dir(tmp_path: Path) -> None:
+    """The isolated state parent is outside the reapable bridge_dir under state_root."""
+    bridge_dir = tmp_path / "antigravity-native" / "bridge"
+    home = agy_home_dir(bridge_dir)
+    assert home == tmp_path / "antigravity-state" / "bridge" / "agy-home"
+    assert home.parent != bridge_dir
+
+
+def test_agy_home_dir_migrates_legacy_dir(tmp_path: Path) -> None:
+    """Legacy agy-home inside bridge_dir is moved to state_root."""
+    bridge_dir = tmp_path / "antigravity-native" / "bridge"
+    legacy = bridge_dir / "agy-home"
+    legacy.mkdir(parents=True)
+    marker = legacy / "test_marker.txt"
+    marker.write_text("hello", encoding="utf-8")
+
+    home = agy_home_dir(bridge_dir)
+    assert not legacy.exists()
+    assert (home / "test_marker.txt").read_text(encoding="utf-8") == "hello"
 
 
 def test_agy_gemini_dir_is_under_agy_home_dir(tmp_path: Path) -> None:
@@ -2309,3 +2342,37 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_prune_orphaned_bridge_dirs_preserves_legacy_agy_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Orphan sweep rescues legacy agy-home into state_root before wiping the bridge dir."""
+    import subprocess
+    import sys
+
+    root = tmp_path / "antigravity-native"
+    state = tmp_path / "antigravity-state"
+    root.mkdir(parents=True)
+    state.mkdir(parents=True)
+    monkeypatch.setattr(_mod, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr(_mod, "_STATE_ROOT", state)
+
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    dead_dir = root / "dead_with_history"
+    dead_dir.mkdir()
+    (dead_dir / "owner.pid").write_text(str(dead.pid), encoding="utf-8")
+    legacy_home = dead_dir / "agy-home" / ".gemini"
+    legacy_home.mkdir(parents=True)
+    (legacy_home / "important_history.db").write_text("conv_data", encoding="utf-8")
+
+    pruned = _mod.prune_orphaned_bridge_dirs()
+
+    assert pruned == 1
+    assert not dead_dir.exists()
+    rescued_db = state / "dead_with_history" / "agy-home" / ".gemini" / "important_history.db"
+    assert rescued_db.exists()
+    assert rescued_db.read_text(encoding="utf-8") == "conv_data"
+
